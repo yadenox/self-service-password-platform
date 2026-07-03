@@ -11,11 +11,13 @@
 - [配置指南](#配置指南)
 - [OAuth 认证配置](#oauth-认证配置)
   - [钉钉配置](#钉钉-dingtalk-配置)
-  - [企业微信配置](#企业微信-wechat-配置)
+  - [企业微信配置](#企业微信配置)
   - [飞书配置](#飞书-feishu-配置)
+- [认证、授权与账号绑定安全逻辑](#认证授权与账号绑定安全逻辑)
 - [LDAP/AD 配置](#ldapad-配置)
 - [AD 服务账号权限配置](#ad-服务账号权限配置)
 - [运行方式](#运行方式)
+- [生产配置检查清单](#生产配置检查清单)
 - [扩展开发指南](#扩展开发指南)
 - [界面效果](#界面效果)
 
@@ -57,7 +59,7 @@
 
 ### 4. 身份验证
 支持认证方式：
-- **OAuth 认证**：钉钉、企业微信（企业级应用）
+- **OAuth 认证**：钉钉、企业微信、飞书（企业级应用）
 - **SMS 二次验证**：支持阿里云、腾讯云、华为云等 SMS 服务商
 
 ---
@@ -74,7 +76,7 @@
 | **LDAPFactory** | 根据配置自动创建 AD 或 OpenLDAP 适配器 | `utils/ldap/factory.py` |
 | **ADAdapter** | 处理 AD 特定操作（NTLM 认证、unicodePwd 属性、lockoutTime 等） | `utils/ldap/ad_adapter.py` |
 | **OpenLDAPAdapter** | 处理 OpenLDAP 特定操作（Simple 认证、userPassword 属性等） | `utils/ldap/openldap_adapter.py` |
-| **OAuthFactory** | 创建钉钉/企业微信 OAuth 提供商 | `utils/oauth/factory.py` |
+| **OAuthFactory** | 创建钉钉/企业微信/飞书 OAuth 提供商 | `utils/oauth/factory.py` |
 | **ConfigManager** | 单例配置管理，支持 YAML 加载和环境变量注入 | `utils/config/config_manager.py` |
 | **ResponseBuilder** | 统一构建 API 响应和页面响应上下文 | `apps/password_manager/response_handler.py` |
 | **SMSFactory** | 创建多种 SMS 服务提供商 | `utils/sms/factory.py` |
@@ -134,171 +136,346 @@ python manage.py runserver 0.0.0.0:8000
 
 ## 配置指南
 
-### 配置文件位置和优先级
+### 先理解：这个项目需要配置哪几类东西？
 
-系统按如下优先级加载配置：
+这套系统不是单纯的“改密码页面”，它需要同时打通三类系统：
 
-1. **环境变量方式**（如果设置了 `APP_ENV`）：`conf/config.{APP_ENV}.yaml`
-2. **默认配置**（备选）：`conf/config.yaml`
-3. **示例配置**（参考）：`conf/config.yaml.example`
+| 配置类别 | 作用 | 不配置好的表现 |
+|---------|------|----------------|
+| 应用自身配置 | 控制标题、域名、会话密钥、入口页面、缓存、日志 | 服务启动失败、CSRF 报错、回调 URL 不匹配 |
+| OAuth 应用配置 | 让钉钉/企业微信/飞书确认“当前访问者是谁” | 免登失败、拿不到用户详情、提示授权码过期 |
+| LDAP/AD 配置 | 查询账号并执行改密、重置、解锁 | 找不到账号、权限不足、AD 拒绝修改密码 |
+| 账号绑定规则 | 把 OAuth 返回的邮箱/手机号/userid 映射成 LDAP/AD 登录名 | 张三登录了企业微信，却匹配不到 AD 里的 `zhangsan` |
+| 可选 SMS 配置 | 在 OAuth 基础上追加短信二次验证 | 开启后无法发码、手机号解析失败 |
 
-### 初始化配置
+配置时建议按这个顺序来：先让应用启动，再让 OAuth 免登成功，再确认能查到 LDAP/AD 用户，最后再打开短信、严格证书校验等增强项。一步到位听起来很酷，实际排错时会变成一团毛线球。
 
-```bash
-# 1. 复制配置模板
-copy conf/config.yaml.example conf/config.dev.yaml
+### 配置文件加载规则
 
-# 2. 编辑配置文件，填入实际的 LDAP 服务器信息
-# 3. 设置敏感信息为环境变量（密码、密钥等）
-```
+项目启动时会按 `APP_ENV` 决定读取哪个配置文件：
 
-### 配置文件结构说明
- > 更多配置项说明请参考 `conf/config.yaml.example` 文件中的注释
-```yaml
-# 应用基础配置
-app:
-  title: "Self-Service Password Platform"
-  debug: false  # 生产环境必须为 false
-  secret_key: ""  # Django 会话加密密钥
-  allowed_hosts:
-    - "*"  # 生产环境应指定具体域名
+| 启动环境变量 | 实际读取文件 | 适合场景 |
+|-------------|--------------|----------|
+| 不设置 `APP_ENV` | `conf/config.yaml` | 生产默认配置 |
+| `APP_ENV=dev` | `conf/config.dev.yaml` | 本地开发 |
+| `APP_ENV=prod` | `conf/config.prod.yaml` | 显式生产环境 |
 
-# OAuth 认证提供商
-auth:
-  provider: "wework"  # "ding" 或 "wework"
-  session_timeout: 300
+`conf/config.yaml.example` 只是模板，项目不会直接读取它。首次部署时请先复制一份：
 
-# LDAP 后端配置
-ldap:
-  type: "ad"  # "ad" 或 "openldap"
-  host: "ad.company.com"
-  port: 636
-  use_ssl: true  # 密码修改必须使用 SSL
-  base_dn: "dc=company,dc=com"
-  login_user: "DOMAIN\svc_account"
-  login_password: "${LDAP_PASSWORD}"  # 从环境变量读取
-
-# SMS 短信服务
-sms:
-  provider: "mock"  # "aliyun", "tencent", "huawei", "mock"
-```
-
-### 环境变量注入
-
-配置文件支持 `${VAR_NAME}` 格式的环境变量引用，用于保护敏感信息（如密码、密钥等）。
-> 同时你也可以直接在配置文件中明文写入这些信息，直接通过配置文件加载
-
-#### 两种配置方式对比
-
-| 方式 | 适用场景 | 安全性 | 示例 |
-|------|---------|--------|------|
-| **直接写入配置** | 开发环境、非敏感配置 | ⚠️ 配置文件明文存储 | `app_id: "cli_xxx"` |
-| **环境变量注入** | 生产环境、敏感信息 | ✅ 不存储在配置文件中 | `app_id: "${FEISHU_APP_ID}"` |
-
-> **推荐**：生产环境务必使用环境变量方式配置敏感信息，避免密钥泄露风险。
-
-#### 环境变量语法
-
-```yaml
-# 基本语法：${环境变量名}
-ldap:
-  login_password: "${LDAP_PASSWORD}"
-
-# 带默认值语法：${环境变量名:默认值}
-# 如果环境变量未设置，则使用默认值
-ldap:
-  host: "${LDAP_HOST:ad.company.com}"
-```
-
-#### 设置环境变量
-> 如果采用`conf/config.{APP_ENV}.yaml`中直接配置了敏感信息，则无需设置环境变量
-
-**Windows (CMD):**
-```cmd
-set LDAP_PASSWORD=your_password
-set FEISHU_APP_ID=cli_xxxxxxxxx
-set FEISHU_APP_SECRET=xxxxxxxxxxxxxxxx
-```
-
-**Windows (PowerShell):**
 ```powershell
-$env:LDAP_PASSWORD = "your_password"
-$env:FEISHU_APP_ID = "cli_xxxxxxxxx"
-$env:FEISHU_APP_SECRET = "xxxxxxxxxxxxxxxx"
+# Windows PowerShell，本地开发
+Copy-Item conf/config.yaml.example conf/config.dev.yaml
+$env:APP_ENV = "dev"
+python manage.py runserver 0.0.0.0:8000
 ```
 
-**Linux/Mac:**
 ```bash
-export LDAP_PASSWORD=your_password
-export FEISHU_APP_ID=cli_xxxxxxxxx
-export FEISHU_APP_SECRET=xxxxxxxxxxxxxxxx
+# Linux / Docker 服务器，生产默认文件
+cp conf/config.yaml.example conf/config.yaml
+python manage.py runserver 0.0.0.0:8000
 ```
 
-**Docker Compose (.env 文件):**
-```ini
-# .env 文件
-LDAP_PASSWORD=your_password
-FEISHU_APP_ID=cli_xxxxxxxxx
-FEISHU_APP_SECRET=xxxxxxxxxxxxxxxx
+### 新手配置步骤
+
+#### 1. 生成应用密钥
+
+`app.secret_key` 用于 Django Session 和安全相关签名，必须至少 32 个字符。项目启动后不要随意更换，否则已有会话会全部失效。
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-#### 完整环境变量清单
-
-以下是所有支持环境变量注入的配置项：
-
-| 环境变量 | 配置路径 | 说明 |
-|---------|---------|------|
-| `LDAP_PASSWORD` | `ldap.login_password` | LDAP 服务账号密码 |
-| `LDAP_HOST` | `ldap.host` | LDAP 服务器地址（可选默认值） |
-| `DING_CORP_ID` | `ding_oauth.corp_id` | 钉钉企业 ID |
-| `DING_AGENT_ID` | `ding_oauth.agent_id` | 钉钉应用 ID |
-| `DING_APP_KEY` | `ding_oauth.app_key` | 钉钉应用 Key |
-| `DING_APP_SECRET` | `ding_oauth.app_secret` | 钉钉应用密钥 |
-| `WEWORK_CORP_ID` | `wework_oauth.corp_id` | 企业微信企业 ID |
-| `WEWORK_AGENT_ID` | `wework_oauth.agent_id` | 企业微信应用 ID |
-| `WEWORK_APP_KEY` | `wework_oauth.app_key` | 企业微信应用 Key |
-| `WEWORK_APP_SECRET` | `wework_oauth.app_secret` | 企业微信应用密钥 |
-| `FEISHU_APP_ID` | `oauth_providers.feishu.app_id` | 飞书应用 ID |
-| `FEISHU_APP_SECRET` | `oauth_providers.feishu.app_secret` | 飞书应用密钥 |
-| `SMS_ACCESS_KEY` | `sms.aliyun.access_key_id` | 阿里云 AccessKey |
-| `SMS_ACCESS_SECRET` | `sms.aliyun.access_key_secret` | 阿里云 AccessSecret |
-| `TENCENT_SMS_SECRET_ID` | `sms.tencent.secret_id` | 腾讯云 SecretId |
-| `TENCENT_SMS_SECRET_KEY` | `sms.tencent.secret_key` | 腾讯云 SecretKey |
-
-#### 配置示例（环境变量方式）
+写入配置：
 
 ```yaml
-# conf/config.prod.yaml - 生产环境配置示例
+app:
+  title: "密码自助服务"
+  debug: false
+  secret_key: "替换为上面生成的随机字符串"
+  allowed_hosts:
+    - "pwd.company.com"
+```
 
-# LDAP 配置
-ldap:
-  type: "ad"
-  host: "${LDAP_HOST:ad.company.com}"
-  port: 636
-  use_ssl: true
-  base_dn: "dc=company,dc=com"
-  login_user: "COMPANY\svc_pwd_reset"
-  login_password: "${LDAP_PASSWORD}"
+#### 2. 配置访问域名和入口行为
 
-# OAuth 配置（以飞书为例）
+`oauth.home_url` 建议填写“域名或主机名”，不要带 `http://` 或 `https://`，例如 `pwd.company.com`。代码会根据当前请求协议拼接成回调地址。
+
+```yaml
+app:
+  # index：先进入手动修改密码页面；auth：打开首页就进入免登认证
+  landing_page: "index"
+  # 在钉钉/企业微信/飞书移动端内置浏览器中是否自动进入免登
+  auto_redirect_in_mobile: false
+
+oauth:
+  home_url: "${HOME_URL:pwd.company.com}"
+  # 默认 OAuth 成功后进入重置密码页面，也可以改成 /unlockAccount
+  redirect_url_prefix: "/resetPassword"
+```
+
+如果通过 Nginx/OpenResty 暴露 HTTPS，请确保外部访问地址、OAuth 平台后台配置、`HOME_URL` 三者使用同一个域名。
+
+#### 3. 选择 OAuth 平台
+
+当前支持：
+
+```yaml
 auth:
-  provider: "feishu"
+  provider: "wework"   # 可选：ding、wework、feishu
+  session_timeout: 300
+  session_expire_at_browser_close: true
+```
 
+具体应用凭证统一写在 `oauth_providers` 下：
+
+```yaml
 oauth_providers:
+  ding:
+    corp_id: "${DING_CORP_ID}"
+    app_key: "${DING_APP_KEY}"
+    app_secret: "${DING_APP_SECRET}"
+    app_id: "${DING_AGENT_ID}"
+
+  wework:
+    corp_id: "${WEWORK_CORP_ID}"
+    agent_id: "${WEWORK_AGENT_ID}"
+    agent_secret: "${WEWORK_AGENT_SECRET}"
+
   feishu:
     app_id: "${FEISHU_APP_ID}"
     app_secret: "${FEISHU_APP_SECRET}"
+```
 
-# SMS 配置（以阿里云为例）
+
+#### 4. 配置"OAuth 用户信息 → LDAP/AD 账号"的绑定规则
+
+这是账号安全的核心配置。
+
+OAuth 平台返回的是企业通讯录里的用户信息，LDAP/AD 里真正能改密码的是账号名。    
+后台会确保当前授权认证的用户与LDAP/AD中的对应账号是匹配对应的，不会产生越权问题。    
+即：每个用户只能修改、重置或解锁自己的LDAP/AD账号！
+
+项目会按 `primary` 和 `fallback` 顺序取字段，然后用 `format2username()` 转成用户名：
+
+- `user@company.com` 会转成 `user`
+- `DOMAIN\user` 会转成 `user`
+- `user` 会转成小写 `user`
+
+常见推荐：
+
+```yaml
+oauth:
+  user_identifier_mapping:
+    ding:
+      primary: "email"
+      fallback:
+        - "org_email"
+        - "orgEmail"
+        - "biz_mail"
+        - "mobile"
+    wework:
+      primary: "email"
+      fallback:
+        - "mobile"
+        - "userid"
+    feishu:
+      primary: "email"
+      fallback:
+        - "mobile"
+        - "userid"
+```
+
+如果你的 AD 账号是邮箱前缀（例如邮箱 `zhangsan@company.com`，AD 登录名 `zhangsan`），优先用 `email` 最稳。
+
+如果 AD 账号是工号或手机号，请把 OAuth 平台里对应字段放到 `primary`，并确认 LDAP 搜索过滤器也按同一标识查找。
+
+#### 5. 配置 LDAP/AD 连接
+
+AD 推荐使用 LDAPS 636 端口；重置密码和解锁通常需要服务账号。最小示例：
+
+```yaml
+ldap:
+  type: "ad"
+  host: "ad.company.com"
+  domain: "company.com"
+  login_user: "svc_pwd_reset"
+  login_password: "${LDAP_PASSWORD}"
+  use_ssl: true
+  port: 636
+  base_dn: "dc=company,dc=com"
+  search_filter: "(&(objectclass=user)(sAMAccountName={}))"
+  search_filter_by_email: "(&(objectclass=*)(mail={}))"
+
+  ad:
+    authentication: "ntlm"
+    tls:
+      validate: "none"       # 联调阶段可用 none；生产建议 required 并配置 CA
+      ca_certs_file: ""
+      validate_hostname: true
+```
+
+OpenLDAP 最小示例：
+
+```yaml
+ldap:
+  type: "openldap"
+  host: "ldap.company.com"
+  login_user: "cn=admin,dc=company,dc=com"
+  login_password: "${LDAP_PASSWORD}"
+  use_ssl: true
+  port: 636
+  base_dn: "ou=people,dc=company,dc=com"
+  search_filter: "(&(objectclass=inetOrgPerson)(uid={}))"
+
+  openldap:
+    authentication: "simple"
+    password_hash: "ssha"
+    tls:
+      validate: "none"
+```
+
+#### 6. 配置密码策略
+
+用户提交的新密码会先经过本地策略校验，再提交给 LDAP/AD。如果 AD 域策略更严格，最终仍以 AD 返回结果为准。
+
+```yaml
+password_policy:
+  min_length: 8
+  max_length: 30
+  require_uppercase: true
+  require_lowercase: true
+  require_digits: true
+  require_special_chars: true
+  forbidden_patterns:
+    - "123456"
+    - "password"
+  forbidden_password_file: ""   # 可填写弱密码字典路径，例如 conf/weak_passwords.txt
+```
+
+#### 7. 可选：开启短信二次验证
+
+默认 `sms.enabled: false`。开启后，用户在 OAuth 认证成功后还需要短信验证码才能重置或解锁。
+
+```yaml
 sms:
   enabled: true
-  provider: "aliyun"
+  provider: "aliyun"   # mock、aliyun、tencent、huawei
+
+  mobile_mapping:
+    sources:
+      - type: "ldap"
+        field: "mobile"
+      - type: "oauth"
+        field: "mobile"
+
   aliyun:
     access_key_id: "${SMS_ACCESS_KEY}"
     access_key_secret: "${SMS_ACCESS_SECRET}"
     sign_name: "密码服务"
     template_code: "SMS_123456789"
 ```
+
+手机号解析会按 `sms.mobile_mapping.sources` 顺序查找。建议优先使用 LDAP/AD 中的人事主数据手机号，OAuth 作为补充。
+
+#### 8. 可选：配置代理、缓存和日志
+
+如果服务器访问钉钉/企业微信/飞书 API 需要代理：
+
+```yaml
+network:
+  proxy:
+    enabled: true
+    http_proxy: "http://proxy.company.com:3128"
+    https_proxy: "http://proxy.company.com:3128"
+    no_proxy: "localhost,127.0.0.1,ad.company.com"
+```
+
+缓存用于 Session、限流、短信验证码等：
+
+```yaml
+cache:
+  backend: "memory"    # 单机推荐 memory；多实例建议 database 或外部改造共享缓存
+```
+
+日志路径：
+
+```yaml
+logging:
+  level: "INFO"
+  file_path: "${LOG_PATH:log/app.log}"
+```
+
+### 环境变量注入
+
+配置文件支持 `${VAR_NAME}` 和 `${VAR_NAME:默认值}`：
+
+```yaml
+ldap:
+  host: "${LDAP_HOST:ad.company.com}"
+  login_password: "${LDAP_PASSWORD}"
+```
+
+生产环境建议把密码、Secret、短信 AccessKey 放到环境变量或 Docker `.env`，不要明文提交到 Git。
+
+**Windows PowerShell：**
+
+```powershell
+$env:APP_ENV = "dev"
+$env:HOME_URL = "pwd.company.com"
+$env:LDAP_PASSWORD = "your_password"
+$env:WEWORK_CORP_ID = "wwxxxxxxxx"
+$env:WEWORK_AGENT_ID = "1000001"
+$env:WEWORK_AGENT_SECRET = "xxxxxxxx"
+```
+
+**Linux / Mac：**
+
+```bash
+export APP_ENV=prod
+export HOME_URL=pwd.company.com
+export LDAP_PASSWORD='your_password'
+export WEWORK_CORP_ID='wwxxxxxxxx'
+export WEWORK_AGENT_ID='1000001'
+export WEWORK_AGENT_SECRET='xxxxxxxx'
+```
+
+**Docker Compose `.env`：**
+
+```ini
+HOST_IP=0.0.0.0
+HOME_URL=pwd.company.com
+DJANGO_PORT=9000
+NGINX_HTTP_PORT=8001
+ENABLE_HTTPS=false
+
+LDAP_PASSWORD=your_password
+WEWORK_CORP_ID=wwxxxxxxxx
+WEWORK_AGENT_ID=1000001
+WEWORK_AGENT_SECRET=xxxxxxxx
+LOG_PATH=log/app.log
+```
+
+常用环境变量对应关系：
+
+| 环境变量 | 配置路径 | 说明 |
+|---------|---------|------|
+| `HOME_URL` | `oauth.home_url` | OAuth 回调域名，不建议带协议 |
+| `LOG_PATH` | `logging.file_path` | 应用日志路径 |
+| `LDAP_HOST` | `ldap.host` | LDAP/AD 服务器地址 |
+| `LDAP_PASSWORD` | `ldap.login_password` | LDAP/AD 服务账号密码 |
+| `DING_CORP_ID` | `oauth_providers.ding.corp_id` | 钉钉企业 ID |
+| `DING_AGENT_ID` | `oauth_providers.ding.app_id` | 钉钉 AgentId / 应用 ID |
+| `DING_APP_KEY` | `oauth_providers.ding.app_key` | 钉钉 AppKey |
+| `DING_APP_SECRET` | `oauth_providers.ding.app_secret` | 钉钉 AppSecret |
+| `WEWORK_CORP_ID` | `oauth_providers.wework.corp_id` | 企业微信 CorpId |
+| `WEWORK_AGENT_ID` | `oauth_providers.wework.agent_id` | 企业微信 AgentId |
+| `WEWORK_AGENT_SECRET` | `oauth_providers.wework.agent_secret` | 企业微信应用 Secret |
+| `FEISHU_APP_ID` | `oauth_providers.feishu.app_id` | 飞书 App ID |
+| `FEISHU_APP_SECRET` | `oauth_providers.feishu.app_secret` | 飞书 App Secret |
+| `SMS_ACCESS_KEY` | `sms.aliyun.access_key_id` | 阿里云 SMS AccessKey |
+| `SMS_ACCESS_SECRET` | `sms.aliyun.access_key_secret` | 阿里云 SMS AccessSecret |
+| `TENCENT_SMS_SECRET_ID` | `sms.tencent.secret_id` | 腾讯云 SMS SecretId |
+| `TENCENT_SMS_SECRET_KEY` | `sms.tencent.secret_key` | 腾讯云 SMS SecretKey |
 
 ---
 
@@ -317,7 +494,8 @@ sms:
 
 创建成功后，在应用首页获取：
 - **AgentId**：应用 ID
-- **AppKey**（CorpId）：企业 ID
+- **CorpId**：企业 ID
+- **AppKey**：应用 Key
 - **AppSecret**：应用密钥
 
 #### 第三步：配置权限
@@ -332,7 +510,9 @@ sms:
 在应用管理中配置：
 - **安全域名**：`pwd.company.com`
 - **IP 地址**：应用服务器的公网 IP
-- **回调地址**：`pwd.company.com/auth`（可选，可自动跳过授权页面）
+- **应用首页地址**：`https://pwd.company.com/`
+
+钉钉当前前端流程使用 `dd.runtime.permission.requestAuthCode` 在钉钉客户端内获取免登码，然后跳转到 `/resetPassword?code=...`，所以请优先在钉钉客户端内打开应用测试。
 
 #### 第五步：修改 config.yaml
 
@@ -349,11 +529,12 @@ oauth:
         - "mobile"    # 备选：手机号
 
 # 钉钉 OAuth 应用配置（通过环境变量注入）
-ding_oauth:
-  corp_id: "${DING_CORP_ID}"
-  agent_id: "${DING_AGENT_ID}"
-  app_key: "${DING_APP_KEY}"
-  app_secret: "${DING_APP_SECRET}"
+oauth_providers:
+  ding:
+    corp_id: "${DING_CORP_ID}"
+    app_key: "${DING_APP_KEY}"
+    app_secret: "${DING_APP_SECRET}"
+    app_id: "${DING_AGENT_ID}"
 ```
 
 设置环境变量：
@@ -391,7 +572,8 @@ set DING_APP_SECRET=dingyyyyy
 #### 第三步：配置权限
 
 应用需要获取以下权限：
-- ✅ 读取企业通讯录（用户信息）
+- ✅ 读取成员基础信息
+- ✅ 读取成员详细信息（代码使用 `snsapi_privateinfo` 并调用 `getuserdetail`）
 
 #### 第四步：配置网页授权及 J-SDK
 
@@ -399,6 +581,7 @@ set DING_APP_SECRET=dingyyyyy
 - **可信域名**：`pwd.company.com`
 - **网页授权回调域名**：`pwd.company.com`
 - **企业可信 IP**：应用服务器的公网 IP
+- **应用主页**：`https://pwd.company.com/`
 
 #### 第五步：修改 config.yaml
 
@@ -415,11 +598,11 @@ oauth:
         - "userid"  # 备选：用户 ID
 
 # 企业微信 OAuth 应用配置（通过环境变量注入）
-wework_oauth:
-  corp_id: "${WEWORK_CORP_ID}"
-  agent_id: "${WEWORK_AGENT_ID}"
-  app_key: "${WEWORK_APP_KEY}"
-  app_secret: "${WEWORK_APP_SECRET}"
+oauth_providers:
+  wework:
+    corp_id: "${WEWORK_CORP_ID}"
+    agent_id: "${WEWORK_AGENT_ID}"
+    agent_secret: "${WEWORK_AGENT_SECRET}"
 ```
 
 设置环境变量：
@@ -427,8 +610,7 @@ wework_oauth:
 ```bash
 set WEWORK_CORP_ID=wechatxxxxx
 set WEWORK_AGENT_ID=1000001
-set WEWORK_APP_KEY=wechatkey
-set WEWORK_APP_SECRET=wechatsecret
+set WEWORK_AGENT_SECRET=wechatsecret
 ```
 
 参考截图：
@@ -469,21 +651,20 @@ set WEWORK_APP_SECRET=wechatsecret
 #### 第四步：配置权限
 
 在"权限管理"中启用必要的权限：
-- ✅ `contact:user.base:readonly` - 获取用户基本信息
-- ✅ `contact:user.employee_id:readonly` - 获取员工工号（可选）
-- ✅ `auth:user.id:read` - 获取用户 ID
+- ✅ `authen:user_info:read` 或飞书后台对应的“获取用户身份信息”权限
+- ✅ 如需用邮箱、手机号、工号做账号绑定，请在飞书后台额外开启对应用户信息权限
 
 ![权限管理](docs/screenshot/feishu-4.png)
 
 #### 第五步：配置安全设置
 
 在"安全设置"中配置：
-> 切记要以/结尾，否则会导致授权失败！
+> 回调地址必须与系统生成的 `redirect_uri` 完全一致。当前代码默认使用 `/resetPassword`，不要随手加或删末尾斜杠。
 1. **重定向 URL**：添加回调地址
-   - 格式：`https://pwd.company.com/resetPassword/
+   - 格式：`https://pwd.company.com/resetPassword`
    
 2. **H5 可信域名**：添加应用域名
-   - 格式：`pwd.company.com/`
+   - 格式：`pwd.company.com`
 
 ![安全设置-重定向URL](docs/screenshot/feishu-5.png)
 ![安全设置-H5域名](docs/screenshot/feishu-6.png)
@@ -509,10 +690,12 @@ oauth:
         - "open_id"  # 备选：飞书用户ID
 
 # 飞书 OAuth 应用配置
-feishu_oauth:
-  app_id: "${FEISHU_APP_ID}"
-  app_secret: "${FEISHU_APP_SECRET}"
-  user_identifier_mapping: "open_id"  # 用户标识字段：open_id、union_id、user_id
+oauth_providers:
+  feishu:
+    app_id: "${FEISHU_APP_ID}"
+    app_secret: "${FEISHU_APP_SECRET}"
+    # 可选：飞书内部提取用户标识的字段，默认 open_id
+    user_identifier_mapping: "open_id"
 ```
 
 设置环境变量：
@@ -523,6 +706,184 @@ set FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
 ---
+
+## 认证、授权与账号绑定安全逻辑
+
+### 一句话理解
+
+平台不会因为用户在页面上填了某个 `username` 就允许改密码。它的核心逻辑是：
+
+1. 先由钉钉/企业微信/飞书完成免登录认证，确认“当前访问者是谁”；
+2. 再从 OAuth 返回的可信用户信息中提取账号标识；
+3. 将账号标识格式化为 LDAP/AD 用户名；
+4. 立即到 LDAP/AD 查询该账号是否真实存在；
+5. 把“OAuth 身份 + LDAP/AD 用户名 + 授权码 + 会话信息”绑定到服务端 Session；
+6. 用户提交重置或解锁时，再次校验请求里的 username 是否与 Session 中绑定的身份一致；
+7. 校验通过后，才调用 LDAP/AD 执行重置密码或解锁。
+
+也就是说，真正的安全边界在服务端：OAuth 证明人，LDAP/AD 确认账号，Session 绑定防止中途换账号。
+
+### 重置密码流程
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant B as 浏览器/客户端
+    participant O as 钉钉/企业微信/飞书
+    participant S as 本平台
+    participant L as LDAP/AD
+
+    U->>B: 打开 /auth 或移动端自动跳转
+    B->>O: 请求免登授权 code
+    O-->>B: 返回临时 code
+    B->>S: GET /resetPassword?code=...
+    S->>O: 用 code 换取用户详情
+    O-->>S: 返回 email/mobile/userid 等用户信息
+    S->>S: 按 user_identifier_mapping 提取标识
+    S->>S: format2username 转为 LDAP/AD 用户名
+    S->>L: 查询账号是否存在
+    L-->>S: 返回用户 DN / 账号状态
+    S->>S: bind_oauth_identity 写入服务端 Session
+    S-->>B: 展示只读 username 的重置页面
+    U->>B: 输入新密码并提交
+    B->>S: POST /api/password/reset
+    S->>S: verify_identity 校验请求账号等于已认证账号
+    S->>S: 校验密码策略 / 可选 SMS 状态 / 限流
+    S->>L: reset_password(username, new_password)
+    S->>L: 尝试 unlock_account(username)
+    S-->>B: 返回操作结果
+```
+
+### 如何确保“绑定的是本人账号”？
+
+关键点在这几个服务端检查：
+
+| 检查点 | 代码位置 | 作用 |
+|-------|----------|------|
+| OAuth code 换用户详情 | `provider.get_user_detail()` | code 只能由企业平台签发，用于确认当前访问者 |
+| 字段映射 | `get_user_identifier()` | 只从 OAuth 返回信息中取账号标识，不信任用户手填 |
+| 用户名格式化 | `format2username()` | 将邮箱、`DOMAIN\username` 统一成 LDAP/AD 登录名 |
+| LDAP/AD 存在性校验 | `ldap_adapter.get_user_dn(username)` | OAuth 用户必须能在 LDAP/AD 中找到对应账号 |
+| Session 身份绑定 | `SessionManager.bind_oauth_identity()` | 服务端保存已认证 username、oauth_id、code、时间戳、IP、User-Agent |
+| 提交时身份一致性校验 | `SessionManager.verify_identity()` | 防止把页面参数改成别人的 username 后提交 |
+| 授权码时效校验 | `verify_auth_code()` / `verify_identity()` | 当前认证默认 5 分钟有效，过期需重新授权 |
+
+因此，攻击者即使修改浏览器里的隐藏字段或请求参数，例如把 `username=zhangsan` 改成 `username=lisi`，服务端也会因为 Session 中绑定的 OAuth 身份不一致而拒绝。
+
+### 本项目是如何防止 OAuth 认证后越权修改其他用户？
+
+这里要特别区分两个概念：
+
+- **认证**：OAuth 平台证明“当前登录者是谁”。
+- **授权**：本平台决定“这个登录者只允许操作哪个 LDAP/AD 账号”。
+
+本平台的授权对象不是前端传来的 `username`，而是服务端在 OAuth 回调阶段绑定下来的 `oauth_username`。
+
+用户后续能不能重置密码或解锁账号，取决于请求账号是否与这个服务端绑定身份完全一致。
+
+#### 服务端防越权链路
+
+1. 用户完成 OAuth 免登后，平台调用 `provider.get_user_detail(code, home_url)` 从钉钉/企业微信/飞书获取用户详情。
+2. 平台调用 `get_user_identifier(user_info, provider_type)`，只从 OAuth 返回的可信字段中提取账号标识，例如 `email`、`mobile`、`userid`。
+3. 平台调用 `format2username(identifier)` 将标识转换为 LDAP/AD 用户名，例如 `zhangsan@company.com` 转为 `zhangsan`。
+4. 平台调用 `ldap_adapter.get_user_dn(username)` 确认这个账号真实存在于 LDAP/AD。
+5. 平台调用 `SessionManager.bind_oauth_identity()`，把认证结果写入服务端 Session 的固定 key：`_oauth_auth`。
+6. 用户提交 `/api/password/reset` 或 `/api/account/unlock` 时，服务端重新格式化请求中的 `username`。
+7. 服务端调用 `SessionManager.verify_identity(request, username)`，比较请求账号和 Session 中的 `oauth_username`。
+8. 如果不一致，立即返回 `UNAUTHORIZED`，并记录安全事件，不会执行 `reset_password()` 或 `unlock_account()`。
+
+#### 篡改请求时会发生什么？
+
+假设张三通过 OAuth 登录后，Session 中绑定的是：
+
+```text
+_oauth_auth.oauth_username = "zhangsan"
+```
+
+如果他在浏览器开发者工具或抓包工具中把提交参数改成：
+
+```text
+username = "lisi"
+```
+
+服务端会执行如下判断：
+
+```text
+请求 username: lisi
+Session oauth_username: zhangsan
+判断结果: 不一致，拒绝操作
+```
+
+对应结果：
+
+- 密码重置接口 `/api/password/reset` 会返回 `UNAUTHORIZED`；
+- 账号解锁接口 `/api/account/unlock` 会返回 `UNAUTHORIZED`；
+- 审计日志会记录 `unauthorized_password_reset_attempt` 或 `unauthorized_unlock_attempt`；
+- LDAP/AD 写操作不会被调用。
+
+所以，“页面输入框只读”只是用户体验层面的限制，真正的防越权控制在服务端完成。
+
+#### 防越权依赖的配置前提
+
+这套保护依赖管理员正确配置账号绑定规则。请重点确认：
+
+| 配置项 | 要求 |
+|--------|------|
+| `oauth.user_identifier_mapping.*.primary` | 应指向能唯一对应 LDAP/AD 账号的字段，优先推荐企业邮箱或工号 |
+| `oauth.user_identifier_mapping.*.fallback` | 只能放同样可信且能唯一绑定账号的字段，不建议随意把多人可共享或不稳定字段作为兜底 |
+| `ldap.search_filter` | 必须按映射后的 username 查找唯一用户 |
+| `ldap.base_dn` | 应限制在允许自助操作的用户 OU 范围内，避免搜索范围过大 |
+| OAuth 应用可见范围 | 应限制在允许使用自助密码服务的员工范围内 |
+
+如果 OAuth 字段与 LDAP/AD 账号不是一一对应关系，平台会“安全地拒绝”或“绑定到错误账号”。
+
+后者是配置风险，不是前端权限能补救的；上线前必须用真实员工样本验证映射结果。
+
+#### 管理员自测越权保护
+
+上线前建议做一次负向测试：
+
+1. 用测试用户 `zhangsan` 完成 OAuth 登录，进入重置密码页面。
+2. 打开浏览器开发者工具或使用抓包工具，把提交请求中的 `username` 改成另一个测试账号 `lisi`。
+3. 提交请求。
+4. 预期结果：
+   - 页面或接口返回“无权操作，认证信息不匹配”；
+   - 响应错误码为 `UNAUTHORIZED`；
+   - `lisi` 的 LDAP/AD 密码没有变化；
+   - 审计日志中出现越权尝试记录。
+
+### 密码修改、密码重置、账号解锁的差异
+
+| 功能 | 入口 | 身份校验方式 | LDAP/AD 操作方式 |
+|------|------|--------------|------------------|
+| 修改密码 | `/` → `/api/password/change` | 用户输入旧密码，LDAP/AD 用旧密码认证 | 使用用户自己的凭据执行 `change_password` |
+| 重置密码 | `/auth` → `/resetPassword` → `/api/password/reset` | OAuth 免登 + Session 身份绑定 + 可选 SMS | 使用服务账号执行 `reset_password` |
+| 解锁账号 | `/unlockAccount` → `/api/account/unlock` | OAuth 免登 + Session 身份绑定 + 可选 SMS | 使用服务账号执行 `unlock_account` |
+
+修改密码要求用户知道旧密码；重置密码和解锁账号不要求旧密码，所以必须依赖 OAuth 身份绑定、LDAP/AD 存在性校验、服务账号最小权限和审计日志共同保护。
+
+### 还有哪些安全保护？
+
+- **Session 防固定攻击**：OAuth 认证成功后调用 `session.cycle_key()` 轮换 Session ID。
+- **短有效期**：认证上下文默认 5 分钟有效，超时后需要重新授权。
+- **可选二次验证**：`sms.enabled: true` 后，重置和解锁前必须先完成短信验证。
+- **限流**：密码重置、账号解锁、短信发送和验证码验证都有基于缓存的频率限制。
+- **密码策略**：新密码会先按 `password_policy` 做长度、复杂度、弱口令和正则规则校验。
+- **账号状态检查**：写密码前会检查账号是否禁用，账号不存在或禁用时拒绝操作。
+- **审计日志**：OAuth 成功/失败、密码重置、账号解锁、限流、安全事件都会写审计日志。
+- **服务账号权限校验**：启动时可检查服务账号是否属于危险管理员组，避免使用过大的域权限。
+- **LDAPS/TLS**：AD 修改 `unicodePwd` 需要加密通道，生产环境必须使用 LDAPS 或等效安全连接。
+
+### 管理员最需要确认的绑定规则
+
+上线前请拿 3~5 个真实员工做交叉检查：
+
+| 员工 | OAuth 返回字段 | 映射后 username | LDAP/AD 实际账号 | 是否一致 |
+|------|----------------|-----------------|------------------|----------|
+| 张三 | `email=zhangsan@company.com` | `zhangsan` | `sAMAccountName=zhangsan` | ✅ |
+| 李四 | `userid=10086` | `10086` | `uid=10086` | ✅ |
+
+如果这里不一致，不要靠用户自己输入账号来“补救”，应该调整 `oauth.user_identifier_mapping` 或 LDAP 搜索过滤器，让平台能够稳定、自动地绑定到正确账号。
 
 ## LDAP/AD 配置
 
@@ -680,7 +1041,7 @@ New-ADUser -Name $Name `
            -AccountPassword $SecurePassword `
            -Enabled $true `
            -PasswordNeverExpires $true `
-           -Description $Descripti
+           -Description $Description
 ```
 
 **参数说明：**
@@ -698,21 +1059,21 @@ New-ADUser -Name $Name `
 # 定义目标 OU（包含需要重置密码的用户）
 $targetOU = "OU=Employees,DC=company,DC=com"
 $targetDomain = "COMPANY"
-$targerAccount = "$targetDomain\svc_pwd_reset"
+$targetAccount = "$targetDomain\svc_pwd_reset"
 
 # Reset password
-dsacls $targetOU /I:S /G "$targetDOMAIN\svc_pwd_reset:CA;Reset Password;user"
+dsacls $targetOU /I:S /G "${targetAccount}:CA;Reset Password;user"
 
 # Unlock account
-dsacls $targetOU /I:S /G "$targetDOMAIN\svc_pwd_reset:RP;lockoutTime;user"
-dsacls $targetOU /I:S /G "$targetDOMAIN\svc_pwd_reset:WP;lockoutTime;user"
+dsacls $targetOU /I:S /G "${targetAccount}:RP;lockoutTime;user"
+dsacls $targetOU /I:S /G "${targetAccount}:WP;lockoutTime;user"
 
 # Account status checks
-dsacls $targetOU /I:S /G "$targetDOMAIN\svc_pwd_reset:RP;userAccountControl;user"
+dsacls $targetOU /I:S /G "${targetAccount}:RP;userAccountControl;user"
 
 # Password state control
-dsacls $targetOU /I:S /G "$targetDOMAIN\svc_pwd_reset:RP;pwdLastSet;user"
-dsacls $targetOU /I:S /G "$targetDOMAIN\svc_pwd_reset:WP;pwdLastSet;user"
+dsacls $targetOU /I:S /G "${targetAccount}:RP;pwdLastSet;user"
+dsacls $targetOU /I:S /G "${targetAccount}:WP;pwdLastSet;user"
 
 ```
 
@@ -816,6 +1177,44 @@ docker compose up -d --force-recreate        # 重新创建容器
 4. 将对应名称的证书和私钥文件到项目的run/nginx/certs目录下
 
 > 参考项目的 `docker-compose.yaml`
+
+---
+
+## 生产配置检查清单
+
+上线前建议逐项确认：
+
+| 检查项 | 推荐值/动作 | 原因 |
+|--------|-------------|------|
+| `app.debug` | `false` | 避免暴露调试信息 |
+| `app.secret_key` | 32 位以上随机字符串，启动后不要频繁更换 | 保护 Session 和签名安全 |
+| `app.allowed_hosts` | 配置真实域名，不建议生产使用 `*` | 降低 Host Header 风险 |
+| `oauth.home_url` | `pwd.company.com`，不要带协议 | 避免 CSRF / OAuth 回调 URL 拼接异常 |
+| OAuth 平台回调域名 | 与 `https://pwd.company.com/resetPassword` 完全一致 | OAuth 平台通常严格校验 redirect_uri |
+| OAuth 权限范围 | 只授予读取用户身份、邮箱、手机号等必要权限 | 最小权限原则 |
+| `oauth.user_identifier_mapping` | 用真实员工样本验证映射结果 | 确保 OAuth 用户绑定到正确 LDAP/AD 账号 |
+| `ldap.use_ssl` | `true`，AD 推荐 636 | AD 修改密码需要安全通道 |
+| `ldap.ad.tls.validate` | 联调可 `none`，生产建议 `required` + CA | 防止中间人攻击 |
+| 服务账号 | 专用账号，不加入 Domain Admins 等高危组 | 避免服务被攻破后拥有域管理员权限 |
+| `ldap.security.validation_mode` | 生产建议 `strict` 或至少保留 `warning` | 启动时发现危险权限配置 |
+| `sms.enabled` | 高风险环境建议开启 | OAuth 之外增加二次验证 |
+| `cache.backend` | 单机 `memory`；多实例不要用本地内存共享安全状态 | Session、限流、短信验证码依赖缓存 |
+| 日志和审计 | 确认 `logging.file_path` 可写，并定期归档 | 方便追踪重置、解锁和异常事件 |
+| HTTPS | 生产必须启用，并确保证书链完整 | 保护 Cookie、OAuth code 和密码提交 |
+
+### 常见配置问题排查
+
+| 现象 | 优先检查 |
+|------|----------|
+| 启动时报“配置文件不存在” | `APP_ENV` 是否指向了实际存在的 `conf/config.{APP_ENV}.yaml` |
+| 启动时报 `SECRET_KEY配置无效` | `app.secret_key` 是否为空或少于 32 个字符 |
+| OAuth 提示 redirect_uri 不匹配 | 平台后台回调地址、`HOME_URL`、`oauth.redirect_url_prefix` 是否完全一致 |
+| 企业微信拿不到用户详情 | 是否开启详细信息权限，应用可见范围是否包含当前用户，可信 IP 是否正确 |
+| 钉钉提示 SDK 未加载 | 是否在钉钉客户端内打开 H5 应用 |
+| 飞书授权成功但换 token 失败 | 飞书后台重定向 URL 是否精确配置为 `/resetPassword` |
+| OAuth 成功但提示账号不存在 | `oauth.user_identifier_mapping` 映射结果是否等于 LDAP/AD 登录名 |
+| 重置密码失败，AD 拒绝执行 | 是否使用 LDAPS、服务账号是否有 Reset Password 权限、密码是否符合域策略 |
+| 开启短信后无法提交 | 是否先完成 `/api/sms/verify`，手机号是否能从 LDAP/OAuth 获取 |
 
 ---
 
@@ -1179,17 +1578,20 @@ ERROR_CODE_MAPPING = {
 
 ### 桌面端
 
-<img alt="截图1" width="500" src="docs/screenshot/QQ截图20230116152954.png">
 
-<img alt="截图2" width="500" src="docs/screenshot/212473880-4a59c535-85bb-42d2-a99a-899265c83136.png">
+<img alt="截图1" width="500" src="docs/screenshot/QQ截图20230116152954.png">   
+  
 
-<img alt="截图3" width="500" src="docs/screenshot/212474222-e1c13e1b-bb6f-4523-b040-24a65055d681.png">
+<img alt="截图2" width="500" src="docs/screenshot/212473880-4a59c535-85bb-42d2-a99a-899265c83136.png">   
+
+
+<img alt="截图3" width="500" src="docs/screenshot/212474222-e1c13e1b-bb6f-4523-b040-24a65055d681.png">   
 
 ### 移动端
 
-<img alt="截图4" width="500" src="docs/screenshot/212474177-dd68b0c9-81cc-4eb0-9196-e760784e3f69.jpg">
+<img alt="截图4" width="500" src="docs/screenshot/212474177-dd68b0c9-81cc-4eb0-9196-e760784e3f69.jpg">   
 
-<img alt="截图5" width="500" src="docs/screenshot/212474293-0cd60898-22c3-4258-ac4c-dfee52a6cf1e.png">
+<img alt="截图5" width="500" src="docs/screenshot/212474293-0cd60898-22c3-4258-ac4c-dfee52a6cf1e.png">   
 
 ---
 
