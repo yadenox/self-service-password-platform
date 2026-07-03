@@ -63,7 +63,7 @@
 ## 系统架构
 
 ### 分层设计
-![架构](docs\screenshot\top-logic.png)
+![架构](docs/screenshot/top-logic.png)
 
 ### 核心组件说明
 
